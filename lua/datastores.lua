@@ -232,9 +232,15 @@ function cassandra_helper.store_body_and_headers(cluster, ids, cache_key, namesp
     cassandra_helper.execute(cluster, stmt, args, {consistency = consistency})
 end
 
--- Fetch a response body and headers from Cassandra for a cache key.
--- @return hash-like lua table OR nil if the cache key doesn't exist
-function cassandra_helper.fetch_body_and_headers(
+local function EmptyResults()
+    return {
+        body = nil,
+        headers = nil,
+        cassandra_error = true,
+    }
+end
+
+function cassandra_helper._fetch_body_and_headers_async(
     cluster,
     id,
     cache_key,
@@ -243,13 +249,7 @@ function cassandra_helper.fetch_body_and_headers(
     vary_headers,
     num_buckets
 )
-    local result = {
-        body = nil,
-        headers = nil,
-        cassandra_error = true,
-    }
-    if not cluster then return result end
-
+    local result = EmptyResults()
     local bucket = cassandra_helper.get_bucket(cache_key, id, cache_name, namespace, num_buckets)
     local res, err = cassandra_helper.execute(
         cluster,
@@ -283,6 +283,53 @@ function cassandra_helper.fetch_body_and_headers(
         headers = json:decode(res[1]['headers']),
         cassandra_error = false,
     }
+end
+
+local function wait_for_timeout(delay_ms)
+    ngx.sleep(delay_ms / 1000)
+    return EmptyResults()
+end
+
+-- Fetch a response body and headers from Cassandra for a cache key.
+-- @return hash-like lua table OR nil if the cache key doesn't exist
+function cassandra_helper.fetch_body_and_headers(
+    cluster,
+    id,
+    cache_key,
+    namespace,
+    cache_name,
+    vary_headers,
+    num_buckets
+)
+    if not cluster then return EmptyResults() end
+
+    local cass_async_thread, spawn_err = ngx.thread.spawn(
+        cassandra_helper._fetch_body_and_headers_async,
+        cluster,
+        id,
+        cache_key,
+        namespace,
+        cache_name,
+        vary_headers,
+        num_buckets
+    )
+    if not cass_async_thread then
+        ngx.log(ngx.ERR, "failed to spawn thread g: ", spawn_err)
+        return EmptyResults()
+    end
+
+    local timeout_thread, err = ngx.thread.spawn(wait_for_timeout, 100)
+    if not timeout_thread then
+        ngx.log(ngx.ERR, "failed to spawn thread g: ", err)
+        return EmptyResults()
+    end
+
+    local ok, res = ngx.thread.wait(cass_async_thread, timeout_thread)
+    if not ok then
+        ngx.log(ngx.ERR, "failed to wait: ", res)
+        return EmptyResults()
+    end
+    return res
 end
 
 -- Refreshes the cassandra cluster topology. lua-cassandra doesn't do that automatically
